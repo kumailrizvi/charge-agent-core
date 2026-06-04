@@ -1,0 +1,61 @@
+{
+  "user": null,
+  "onboarding": {
+    "step": 0,
+    "done": false
+  },
+  "profile": {
+    "name": "",
+    "email": "",
+    "phone": "",
+    "linkedin": "",
+    "location": "",
+    "resumeText": "",
+    "resumeFileName": "",
+    "resumeFilePath": "",
+    "experiences": [],
+    "education": [],
+    "skills": [],
+    "projects": [],
+    "defaults": {
+      "workAuthorization": "",
+      "sponsorship": "",
+      "salary": "Open to market range",
+      "relocate": "No",
+      "remote": "Yes",
+      "start": "Immediately",
+      "dei": "Prefer not to answer",
+      "autoSubmit": false
+    }
+  },
+  "target": {
+    "roles": [],
+    "countries": [],
+    "cities": [],
+    "workplace": "remote",
+    "industries": [
+      "fintech",
+      "payments",
+      "lending",
+      "saas"
+    ]
+  },
+  "jobs": [],
+  "applications": [],
+  "sources": [],
+  "messages": [],
+  "atsAccounts": [],
+  "logs": [
+    {
+      "at": "2026-06-04T18:15:25.918Z",
+      "type": "crawler",
+      "message": "Crawler finished. Added 0. Total 0."
+    },
+    {
+      "at": "2026-06-04T18:14:45.450Z",
+      "type": "crawler",
+      "message": "Crawler started (startup)"
+    }
+  ],
+  "credits": 25
+}
