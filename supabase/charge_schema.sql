@@ -1,16 +1,11 @@
 create table if not exists public.charge_state (
-  user_key text primary key,
+  session_id text primary key,
   state jsonb not null default '{}'::jsonb,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
+  updated_at timestamptz not null default now(),
+  created_at timestamptz not null default now()
 );
 
-alter table public.charge_state enable row level security;
+create index if not exists charge_state_updated_at_idx on public.charge_state(updated_at desc);
+create index if not exists charge_state_user_email_idx on public.charge_state ((state->'user'->>'email'));
 
-drop policy if exists "service role can manage charge_state" on public.charge_state;
-create policy "service role can manage charge_state"
-on public.charge_state
-for all
-to service_role
-using (true)
-with check (true);
+-- Storage bucket must exist in Supabase UI as private bucket named: resumes

@@ -1,316 +1,278 @@
-/* Charge Vercel API catch-all
-   Fixes: /api/resume, /api/state, /api/debug/env on Vercel without local filesystem.
-   Uses Supabase REST + Storage directly so it works in serverless.
+/* Charge Vercel API catch-all: signup/login/logout/state/resume upload.
+   Drop this file into: api/[...path].js
+   Requires Vercel env vars: SUPABASE_URL, SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, APP_URL, NODE_ENV
 */
 
-const DEFAULT_STATE = {
-  user: null,
-  onboarding: { step: 0, done: false },
-  profile: {
-    name: "",
-    email: "",
-    applicationEmail: "",
-    phone: "",
-    linkedin: "",
-    location: "",
-    address: "",
-    city: "",
-    state: "",
-    country: "",
-    postalCode: "",
-    summary: "",
-    resumeText: "",
-    resumeFileName: "",
-    resumeFilePath: "",
-    experiences: [],
-    education: [],
-    skills: [],
-    projects: [],
-    defaults: {
-      workAuthorization: "",
-      sponsorship: "",
-      salary: "Open to market range",
-      relocate: "No",
-      remote: "Yes",
-      start: "Immediately",
-      dei: "Prefer not to answer",
-      autoSubmit: false,
-      tailoring: "light",
-      coverMode: "light",
-      applicationPassword: ""
-    }
-  },
-  target: {
-    roles: [],
-    countries: [],
-    cities: [],
-    workplace: "remote",
-    industries: ["fintech", "payments", "lending", "saas"]
-  },
-  jobs: [],
-  applications: [],
-  sources: [],
-  messages: [],
-  atsAccounts: [],
-  logs: [],
-  credits: 25,
-  jobsCount: 0
-};
+const crypto = require('crypto');
 
-function json(res, status, body) {
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || '';
+const BUCKET = process.env.SUPABASE_RESUME_BUCKET || 'resumes';
+
+function json(res, status, body, headers = {}) {
   res.statusCode = status;
-  res.setHeader("content-type", "application/json; charset=utf-8");
+  Object.entries({ 'Content-Type': 'application/json', ...headers }).forEach(([k, v]) => res.setHeader(k, v));
   res.end(JSON.stringify(body, null, 2));
 }
 
-function getPath(req) {
-  const url = new URL(req.url, `https://${req.headers.host || "charge.local"}`);
-  return url.pathname.replace(/^\/api\/?/, "").replace(/^\/+/, "");
-}
-
-function getUserKey(req) {
-  const fromHeader = req.headers["x-charge-user"] || req.headers["x-user-id"];
-  return String(fromHeader || "default").slice(0, 120);
-}
-
-function env() {
+function defaultState() {
   return {
-    supabaseUrl: process.env.SUPABASE_URL,
-    serviceRole: process.env.SUPABASE_SERVICE_ROLE_KEY,
-    anonKey: process.env.SUPABASE_ANON_KEY,
-    appUrl: process.env.APP_URL,
-    nodeEnv: process.env.NODE_ENV
+    user: null,
+    onboarding: { step: 0, done: false },
+    profile: {
+      name: '', email: '', applicationEmail: '', phone: '', linkedin: '', location: '', address: '', city: '', state: '', country: '', postalCode: '', summary: '', resumeText: '', resumeFileName: '', resumeFilePath: '',
+      experiences: [], education: [], skills: [], projects: [],
+      defaults: { workAuthorization: '', sponsorship: '', salary: 'Open to market range', relocate: 'No', remote: 'Yes', start: 'Immediately', dei: 'Prefer not to answer', autoSubmit: false, tailoring: 'light', coverMode: 'light', applicationPassword: '' }
+    },
+    target: { roles: [], countries: [], cities: [], workplace: 'remote', industries: ['fintech', 'payments', 'lending', 'saas'] },
+    jobs: [], applications: [], sources: [], messages: [], atsAccounts: [], logs: [], credits: 25, jobsCount: 0
   };
 }
 
-function requireSupabase() {
-  const e = env();
-  if (!e.supabaseUrl || !e.serviceRole) {
-    const missing = [];
-    if (!e.supabaseUrl) missing.push("SUPABASE_URL");
-    if (!e.serviceRole) missing.push("SUPABASE_SERVICE_ROLE_KEY");
-    const err = new Error(`Missing env vars: ${missing.join(", ")}`);
-    err.statusCode = 500;
-    throw err;
+function getPath(req) {
+  try { return new URL(req.url, 'https://charge.local').pathname; } catch { return req.url.split('?')[0]; }
+}
+
+function getCookie(req, name) {
+  const header = req.headers.cookie || '';
+  const parts = header.split(';').map(x => x.trim());
+  for (const p of parts) {
+    const [k, ...rest] = p.split('=');
+    if (k === name) return decodeURIComponent(rest.join('='));
   }
-  return e;
+  return '';
+}
+
+function setSessionCookie(res, sessionId) {
+  res.setHeader('Set-Cookie', `charge_session=${encodeURIComponent(sessionId)}; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=2592000`);
+}
+
+function clearSessionCookie(res) {
+  res.setHeader('Set-Cookie', 'charge_session=; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=0');
 }
 
 async function readBody(req) {
   const chunks = [];
-  for await (const chunk of req) chunks.push(Buffer.from(chunk));
+  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
   return Buffer.concat(chunks);
 }
 
-async function supabaseFetch(path, options = {}) {
-  const e = requireSupabase();
-  const url = `${e.supabaseUrl}${path}`;
-  const headers = {
-    apikey: e.serviceRole,
-    Authorization: `Bearer ${e.serviceRole}`,
-    ...(options.headers || {})
-  };
-  return fetch(url, { ...options, headers });
-}
-
-async function getSavedState(userKey) {
-  try {
-    const r = await supabaseFetch(`/rest/v1/charge_state?user_key=eq.${encodeURIComponent(userKey)}&select=state&limit=1`, {
-      method: "GET",
-      headers: { Accept: "application/json" }
-    });
-    if (!r.ok) return structuredClone(DEFAULT_STATE);
-    const rows = await r.json();
-    return rows && rows[0] && rows[0].state ? { ...structuredClone(DEFAULT_STATE), ...rows[0].state } : structuredClone(DEFAULT_STATE);
-  } catch (_) {
-    return structuredClone(DEFAULT_STATE);
-  }
-}
-
-async function saveState(userKey, state) {
-  const payload = [{ user_key: userKey, state, updated_at: new Date().toISOString() }];
-  const r = await supabaseFetch(`/rest/v1/charge_state?on_conflict=user_key`, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      Prefer: "resolution=merge-duplicates,return=representation"
-    },
-    body: JSON.stringify(payload)
-  });
-  if (!r.ok) {
-    const text = await r.text().catch(() => "");
-    throw new Error(`Supabase state save failed: ${r.status} ${text}`);
-  }
-  return r.json().catch(() => []);
+async function readJson(req) {
+  const raw = await readBody(req);
+  if (!raw.length) return {};
+  try { return JSON.parse(raw.toString('utf8')); } catch { return {}; }
 }
 
 function parseMultipart(buffer, contentType) {
-  const boundaryMatch = /boundary=(?:(?:\")([^\"]+)(?:\")|([^;]+))/i.exec(contentType || "");
-  if (!boundaryMatch) throw new Error("Upload must be multipart/form-data");
-  const boundary = Buffer.from(`--${boundaryMatch[1] || boundaryMatch[2]}`);
-  const parts = [];
-  let start = buffer.indexOf(boundary);
-  while (start !== -1) {
-    start += boundary.length;
-    if (buffer[start] === 45 && buffer[start + 1] === 45) break;
-    if (buffer[start] === 13 && buffer[start + 1] === 10) start += 2;
-    const headerEnd = buffer.indexOf(Buffer.from("\r\n\r\n"), start);
-    if (headerEnd === -1) break;
-    const headersText = buffer.slice(start, headerEnd).toString("utf8");
-    let end = buffer.indexOf(boundary, headerEnd + 4);
-    if (end === -1) break;
-    let dataEnd = end;
-    if (buffer[dataEnd - 2] === 13 && buffer[dataEnd - 1] === 10) dataEnd -= 2;
-    const disposition = /content-disposition:[^\n]*name="([^"]+)"(?:;\s*filename="([^"]*)")?/i.exec(headersText);
-    const typeMatch = /content-type:\s*([^\r\n]+)/i.exec(headersText);
-    if (disposition) {
-      parts.push({
-        name: disposition[1],
-        filename: disposition[2] || "",
-        contentType: typeMatch ? typeMatch[1].trim() : "application/octet-stream",
-        data: buffer.slice(headerEnd + 4, dataEnd)
-      });
+  const match = /boundary=(?:(?:"([^"]+)")|([^;]+))/i.exec(contentType || '');
+  if (!match) return { fields: {}, files: [] };
+  const boundary = '--' + (match[1] || match[2]);
+  const raw = buffer.toString('binary');
+  const parts = raw.split(boundary).slice(1, -1);
+  const fields = {};
+  const files = [];
+  for (const part of parts) {
+    const cleaned = part.replace(/^\r\n/, '').replace(/\r\n$/, '');
+    const idx = cleaned.indexOf('\r\n\r\n');
+    if (idx === -1) continue;
+    const headerText = cleaned.slice(0, idx);
+    const bodyBinary = cleaned.slice(idx + 4);
+    const nameMatch = /name="([^"]+)"/.exec(headerText);
+    const filenameMatch = /filename="([^"]*)"/.exec(headerText);
+    const typeMatch = /Content-Type:\s*([^\r\n]+)/i.exec(headerText);
+    const name = nameMatch ? nameMatch[1] : '';
+    const body = Buffer.from(bodyBinary, 'binary');
+    if (filenameMatch && filenameMatch[1]) {
+      files.push({ field: name, filename: filenameMatch[1], contentType: typeMatch ? typeMatch[1].trim() : 'application/octet-stream', buffer: body });
+    } else if (name) {
+      fields[name] = body.toString('utf8');
     }
-    start = end;
   }
-  return parts;
+  return { fields, files };
 }
 
-function basicResumeProfileFromText(text, filename) {
-  const lines = String(text || "")
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter(Boolean);
-  const joined = lines.join("\n");
-  const email = (joined.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i) || [""])[0];
-  const phone = (joined.match(/(?:\+?\d[\d\s().-]{7,}\d)/) || [""])[0].trim();
-  const linkedin = (joined.match(/(?:https?:\/\/)?(?:www\.)?linkedin\.com\/in\/[A-Za-z0-9_-]+\/?/i) || [""])[0];
-  const name = lines[0] && lines[0].length < 80 ? lines[0] : "";
-  const skills = [];
-  const skillBank = [
-    "Product Strategy", "Roadmapping", "User Research", "Fintech", "Payments", "Credit Cards", "Lending", "SaaS",
-    "AI", "Automation", "API Integrations", "Stakeholder Management", "Agile", "Scrum", "Jira", "Figma",
-    "Data Analytics", "SQL", "Python", "JavaScript", "TypeScript", "Risk", "Underwriting", "KYC", "AML"
-  ];
-  for (const s of skillBank) if (joined.toLowerCase().includes(s.toLowerCase())) skills.push(s);
+function textFromUpload(file) {
+  if (!file) return '';
+  const lower = file.filename.toLowerCase();
+  const raw = file.buffer.toString('utf8');
+  if (lower.endsWith('.txt')) return raw;
+  // Minimal PDF/DOC fallback. Production parser should use pdf-parse/docx parser in a background worker.
+  const ascii = file.buffer.toString('latin1').replace(/[^\x20-\x7E\n\r\t]/g, ' ');
+  return ascii.replace(/\s+/g, ' ').slice(0, 20000);
+}
+
+function extractProfile(text, fileName) {
+  const email = (text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i) || [''])[0];
+  const phone = (text.match(/(?:\+?1[\s.-]?)?\(?\d{3}\)?[\s.-]?\d{3}[\s.-]?\d{4}/) || [''])[0];
+  const linkedin = (text.match(/(?:https?:\/\/)?(?:www\.)?linkedin\.com\/in\/[A-Za-z0-9_-]+/i) || [''])[0];
+  const lines = text.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+  const possibleName = lines.find(l => l.length > 3 && l.length < 60 && !l.includes('@') && !/resume|curriculum|experience|education/i.test(l)) || '';
+  const skillsSeed = ['Product Strategy','Roadmapping','Fintech','Payments','Lending','Credit Cards','User Research','Stakeholder Management','API Integrations','AI','SaaS','Analytics'].filter(s => new RegExp(s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i').test(text));
   return {
-    name,
+    name: possibleName,
     email,
     applicationEmail: email,
     phone,
     linkedin,
-    summary: "Product-focused operator with experience shipping customer-facing workflows, managing stakeholders, and driving measurable product outcomes.",
-    resumeText: joined.slice(0, 50000),
-    resumeFileName: filename,
-    skills: [...new Set(skills)].slice(0, 60)
+    resumeText: text,
+    resumeFileName: fileName,
+    skills: skillsSeed,
+    summary: text ? 'Product-focused operator with experience building customer-facing workflows and measurable product outcomes.' : ''
   };
 }
 
-function pseudoPdfText(buffer, filename) {
-  // Safe fallback: extracts visible ASCII-ish strings. It is not perfect PDF parsing,
-  // but it prevents upload from failing on Vercel when native PDF tooling is unavailable.
-  const raw = buffer.toString("latin1");
-  const strings = raw.match(/[A-Za-z0-9@.,:;()&+/#'’\- ]{4,}/g) || [];
-  const text = strings.join("\n").replace(/\s{2,}/g, " ").slice(0, 60000);
-  return text || `Uploaded resume file: ${filename}`;
+async function sb(path, options = {}) {
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY) throw new Error('Missing Supabase env vars');
+  const response = await fetch(`${SUPABASE_URL}${path}`, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_SERVICE_ROLE_KEY,
+      Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+      ...(options.headers || {})
+    }
+  });
+  const text = await response.text();
+  let data;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!response.ok) throw new Error(`Supabase ${response.status}: ${typeof data === 'string' ? data : JSON.stringify(data)}`);
+  return data;
 }
 
-async function uploadResume(req, res) {
+async function loadState(sessionId) {
+  if (!sessionId) return defaultState();
   try {
-    const contentType = req.headers["content-type"] || "";
-    const body = await readBody(req);
-    const parts = parseMultipart(body, contentType);
-    const file = parts.find((p) => p.filename) || parts.find((p) => p.name === "resume");
-    if (!file || !file.data || !file.data.length) return json(res, 400, { ok: false, error: "No resume file found in upload" });
-
-    const userKey = getUserKey(req);
-    const safeName = file.filename.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120) || "resume.pdf";
-    const storagePath = `${userKey}/${Date.now()}-${safeName}`;
-
-    const up = await supabaseFetch(`/storage/v1/object/resumes/${encodeURIComponent(storagePath).replace(/%2F/g, "/")}`, {
-      method: "POST",
-      headers: {
-        "content-type": file.contentType || "application/octet-stream",
-        "x-upsert": "true"
-      },
-      body: file.data
-    });
-    if (!up.ok) {
-      const t = await up.text().catch(() => "");
-      return json(res, 500, { ok: false, error: `Supabase upload failed: ${up.status}`, detail: t.slice(0, 1000) });
-    }
-
-    let resumeText = "";
-    const lower = safeName.toLowerCase();
-    if (lower.endsWith(".txt")) resumeText = file.data.toString("utf8");
-    else if (lower.endsWith(".pdf")) resumeText = pseudoPdfText(file.data, safeName);
-    else if (lower.endsWith(".doc") || lower.endsWith(".docx")) resumeText = pseudoPdfText(file.data, safeName);
-    else resumeText = pseudoPdfText(file.data, safeName);
-
-    const extracted = basicResumeProfileFromText(resumeText, safeName);
-    const current = await getSavedState(userKey);
-    const next = {
-      ...current,
-      onboarding: { step: Math.max(current.onboarding?.step || 0, 1), done: false },
-      profile: {
-        ...current.profile,
-        ...Object.fromEntries(Object.entries(extracted).filter(([, v]) => Array.isArray(v) ? v.length : Boolean(v))),
-        resumeText,
-        resumeFileName: safeName,
-        resumeFilePath: storagePath
-      },
-      logs: [
-        ...(current.logs || []),
-        { at: new Date().toISOString(), type: "resume_upload", message: `Uploaded ${safeName}` }
-      ].slice(-100)
-    };
-    await saveState(userKey, next);
-    return json(res, 200, { ok: true, resumeFileName: safeName, resumeFilePath: storagePath, profile: next.profile, state: next });
+    const rows = await sb(`/rest/v1/charge_state?session_id=eq.${encodeURIComponent(sessionId)}&select=state&limit=1`);
+    if (Array.isArray(rows) && rows[0] && rows[0].state) return rows[0].state;
   } catch (err) {
-    return json(res, err.statusCode || 500, { ok: false, error: err.message || "Resume upload failed" });
+    console.error('loadState failed', err.message);
   }
+  return defaultState();
 }
 
-async function handler(req, res) {
-  const path = getPath(req);
+async function saveState(sessionId, state) {
+  if (!sessionId) throw new Error('Missing session');
+  await sb('/rest/v1/charge_state', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Prefer: 'resolution=merge-duplicates,return=minimal' },
+    body: JSON.stringify({ session_id: sessionId, state, updated_at: new Date().toISOString() })
+  });
+}
+
+async function ensureSession(req, res) {
+  let sessionId = getCookie(req, 'charge_session');
+  if (!sessionId) {
+    sessionId = crypto.randomUUID();
+    setSessionCookie(res, sessionId);
+  }
+  return sessionId;
+}
+
+async function handleSignup(req, res) {
+  const payload = await readJson(req);
+  const email = String(payload.email || payload.user?.email || '').trim();
+  const name = String(payload.name || payload.fullName || payload.user?.name || '').trim();
+  if (!email) return json(res, 400, { ok: false, error: 'Email is required.' });
+
+  const sessionId = crypto.randomUUID();
+  setSessionCookie(res, sessionId);
+  const state = defaultState();
+  state.user = { id: sessionId, email, name, createdAt: new Date().toISOString() };
+  state.profile.email = email;
+  state.profile.applicationEmail = email;
+  state.profile.name = name;
+  state.onboarding.step = 1;
+  await saveState(sessionId, state);
+  return json(res, 200, { ok: true, user: state.user, state });
+}
+
+async function handleLogin(req, res) {
+  const payload = await readJson(req);
+  const email = String(payload.email || '').trim();
+  if (!email) return json(res, 400, { ok: false, error: 'Email is required.' });
+  // MVP login: find a matching saved state by user email. Replace with Supabase Auth next.
+  const rows = await sb(`/rest/v1/charge_state?select=session_id,state&state->user->>email=eq.${encodeURIComponent(email)}&limit=1`);
+  if (!Array.isArray(rows) || !rows[0]) return json(res, 404, { ok: false, error: 'No Charge account found for this email.' });
+  setSessionCookie(res, rows[0].session_id);
+  return json(res, 200, { ok: true, user: rows[0].state.user, state: rows[0].state });
+}
+
+async function handleState(req, res) {
+  const sessionId = await ensureSession(req, res);
+  const state = await loadState(sessionId);
+  return json(res, 200, state);
+}
+
+async function handleSaveState(req, res) {
+  const sessionId = await ensureSession(req, res);
+  const incoming = await readJson(req);
+  const current = await loadState(sessionId);
+  const merged = { ...current, ...incoming, profile: { ...current.profile, ...(incoming.profile || {}) }, onboarding: { ...current.onboarding, ...(incoming.onboarding || {}) } };
+  if (!merged.user && merged.profile?.email) merged.user = { id: sessionId, email: merged.profile.email, name: merged.profile.name || '', createdAt: new Date().toISOString() };
+  await saveState(sessionId, merged);
+  return json(res, 200, { ok: true, state: merged });
+}
+
+async function handleResume(req, res) {
+  const sessionId = await ensureSession(req, res);
+  const raw = await readBody(req);
+  const { fields, files } = parseMultipart(raw, req.headers['content-type']);
+  const file = files[0];
+  if (!file) return json(res, 400, { ok: false, error: 'No resume file received. Upload a PDF, DOC, DOCX, or TXT.' });
+
+  const safeName = file.filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+  const storagePath = `${sessionId}/${Date.now()}-${safeName}`;
+  await sb(`/storage/v1/object/${BUCKET}/${encodeURIComponent(storagePath).replace(/%2F/g, '/')}`, {
+    method: 'POST',
+    headers: { 'Content-Type': file.contentType, 'x-upsert': 'true' },
+    body: file.buffer
+  });
+
+  const text = textFromUpload(file);
+  const extracted = extractProfile(text, file.filename);
+  const state = await loadState(sessionId);
+  state.profile = { ...state.profile, ...extracted, resumeFilePath: storagePath };
+  if (!state.profile.name && fields.name) state.profile.name = fields.name;
+  if (!state.user && state.profile.email) state.user = { id: sessionId, email: state.profile.email, name: state.profile.name || '', createdAt: new Date().toISOString() };
+  state.onboarding.step = Math.max(state.onboarding.step || 0, 1);
+  state.logs = [...(state.logs || []), { at: new Date().toISOString(), type: 'resume_uploaded', fileName: file.filename }];
+  await saveState(sessionId, state);
+
+  return json(res, 200, { ok: true, fileName: file.filename, storagePath, extracted, state });
+}
+
+async function handleLogout(req, res) {
+  clearSessionCookie(res);
+  return json(res, 200, { ok: true });
+}
+
+module.exports = async function handler(req, res) {
   try {
-    if (req.method === "OPTIONS") {
-      res.statusCode = 204;
-      res.end();
-      return;
-    }
-    if (path === "debug/env" && req.method === "GET") {
-      const e = env();
+    const path = getPath(req);
+    if (req.method === 'OPTIONS') return json(res, 200, { ok: true });
+
+    if (path === '/api/debug/env') {
       return json(res, 200, {
         ok: true,
-        nodeEnv: e.nodeEnv || null,
-        appUrl: e.appUrl || null,
-        supabaseUrl: Boolean(e.supabaseUrl),
-        anonKey: Boolean(e.anonKey),
-        serviceRole: Boolean(e.serviceRole),
-        bucketExpected: "resumes",
-        routes: ["GET /api/state", "POST /api/state", "POST /api/resume", "POST /api/upload-resume", "POST /api/upload"]
+        nodeEnv: process.env.NODE_ENV || '',
+        appUrl: process.env.APP_URL || '',
+        supabaseUrl: Boolean(SUPABASE_URL),
+        anonKey: Boolean(SUPABASE_ANON_KEY),
+        serviceRole: Boolean(SUPABASE_SERVICE_ROLE_KEY),
+        bucketExpected: BUCKET,
+        routes: ['GET /api/state', 'POST /api/state', 'POST /api/signup', 'POST /api/login', 'POST /api/logout', 'POST /api/resume', 'POST /api/upload-resume', 'POST /api/upload']
       });
     }
-    if (path === "state" && req.method === "GET") {
-      const state = await getSavedState(getUserKey(req));
-      return json(res, 200, state);
-    }
-    if (path === "state" && req.method === "POST") {
-      const body = await readBody(req);
-      const incoming = body.length ? JSON.parse(body.toString("utf8")) : {};
-      const current = await getSavedState(getUserKey(req));
-      const next = { ...current, ...incoming };
-      await saveState(getUserKey(req), next);
-      return json(res, 200, { ok: true, state: next });
-    }
-    if (["resume", "upload-resume", "upload", "parse-resume"].includes(path) && req.method === "POST") {
-      return uploadResume(req, res);
-    }
-    return json(res, 404, { ok: false, error: `Unknown API route: /api/${path}` });
-  } catch (err) {
-    return json(res, err.statusCode || 500, { ok: false, error: err.message || "API crashed" });
-  }
-}
+    if (path === '/api/state' && req.method === 'GET') return handleState(req, res);
+    if (path === '/api/state' && req.method === 'POST') return handleSaveState(req, res);
+    if (path === '/api/signup' && req.method === 'POST') return handleSignup(req, res);
+    if (path === '/api/login' && req.method === 'POST') return handleLogin(req, res);
+    if (path === '/api/logout' && req.method === 'POST') return handleLogout(req, res);
+    if ((path === '/api/resume' || path === '/api/upload-resume' || path === '/api/upload') && req.method === 'POST') return handleResume(req, res);
 
-module.exports = handler;
+    return json(res, 404, { ok: false, error: `Unknown API route: ${path}` });
+  } catch (error) {
+    console.error('Charge API error:', error && error.stack ? error.stack : error);
+    return json(res, 500, { ok: false, error: error.message || 'Server error' });
+  }
+};
