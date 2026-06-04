@@ -52,17 +52,29 @@ function clearSessionCookie(res) {
   res.setHeader('Set-Cookie', 'charge_session=; Path=/; HttpOnly; SameSite=Lax; Secure; Max-Age=0');
 }
 
+
 async function readBody(req) {
+  // Vercel can provide req.body for JSON requests. Raw stream is needed for multipart uploads.
+  if (req.body) {
+    if (Buffer.isBuffer(req.body)) return req.body;
+    if (typeof req.body === 'string') return Buffer.from(req.body);
+    if (typeof req.body === 'object') return Buffer.from(JSON.stringify(req.body));
+  }
   const chunks = [];
-  for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-  return Buffer.concat(chunks);
+  if (req && typeof req[Symbol.asyncIterator] === 'function') {
+    for await (const chunk of req) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+    return Buffer.concat(chunks);
+  }
+  return Buffer.alloc(0);
 }
 
 async function readJson(req) {
+  if (req.body && typeof req.body === 'object' && !Buffer.isBuffer(req.body)) return req.body;
   const raw = await readBody(req);
   if (!raw.length) return {};
   try { return JSON.parse(raw.toString('utf8')); } catch { return {}; }
 }
+
 
 function parseMultipart(buffer, contentType) {
   const match = /boundary=(?:(?:"([^"]+)")|([^;]+))/i.exec(contentType || '');
@@ -251,6 +263,8 @@ module.exports = async function handler(req, res) {
     const path = getPath(req);
     if (req.method === 'OPTIONS') return json(res, 200, { ok: true });
 
+    if (path === '/api/health') return json(res, 200, { ok: true, ts: new Date().toISOString() });
+
     if (path === '/api/debug/env') {
       return json(res, 200, {
         ok: true,
@@ -260,7 +274,7 @@ module.exports = async function handler(req, res) {
         anonKey: Boolean(SUPABASE_ANON_KEY),
         serviceRole: Boolean(SUPABASE_SERVICE_ROLE_KEY),
         bucketExpected: BUCKET,
-        routes: ['GET /api/state', 'POST /api/state', 'POST /api/signup', 'POST /api/login', 'POST /api/logout', 'POST /api/resume', 'POST /api/upload-resume', 'POST /api/upload']
+        routes: ['GET /api/health', 'GET /api/state', 'POST /api/state', 'POST /api/signup', 'POST /api/login', 'POST /api/logout', 'POST /api/resume', 'POST /api/upload-resume', 'POST /api/upload']
       });
     }
     if (path === '/api/state' && req.method === 'GET') return handleState(req, res);
@@ -273,6 +287,9 @@ module.exports = async function handler(req, res) {
     return json(res, 404, { ok: false, error: `Unknown API route: ${path}` });
   } catch (error) {
     console.error('Charge API error:', error && error.stack ? error.stack : error);
-    return json(res, 500, { ok: false, error: error.message || 'Server error' });
+    return json(res, 500, { ok: false, error: error.message || 'Server error', hint: 'Open Vercel Function Logs for the full stack trace. Common causes: charge_state SQL not run, Supabase env typo, or resume bucket missing.' });
   }
 };
+
+
+module.exports.config = { api: { bodyParser: false } };

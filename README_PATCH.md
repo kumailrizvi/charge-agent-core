@@ -1,14 +1,14 @@
-# Charge signup + resume route patch
+# Charge signup 500 fix
 
-Adds Vercel API routes:
-- GET /api/debug/env
-- GET /api/state
-- POST /api/state
-- POST /api/signup
-- POST /api/login
-- POST /api/logout
-- POST /api/resume
-- POST /api/upload-resume
-- POST /api/upload
+This patch makes the Vercel API handler safer for POST requests by supporting both raw streams and Vercel-parsed `req.body`.
 
-Drop `api/[...path].js` into the project root and run `supabase/charge_schema.sql` in Supabase SQL editor.
+Files:
+- api/[...path].js
+- supabase/charge_schema.sql
+
+After copying, run the SQL in Supabase SQL Editor, then redeploy on Vercel.
+
+Test:
+- /api/health
+- /api/debug/env
+- /api/state
