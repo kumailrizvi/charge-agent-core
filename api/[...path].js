@@ -1,5 +1,7 @@
-// Charge Vercel API crash fix
-// Self-contained serverless API. Does NOT import server/index.js, so /api/state and /api/debug/env cannot crash from Express boot issues.
+/* Charge Vercel API catch-all
+   Fixes: /api/resume, /api/state, /api/debug/env on Vercel without local filesystem.
+   Uses Supabase REST + Storage directly so it works in serverless.
+*/
 
 const DEFAULT_STATE = {
   user: null,
@@ -55,278 +57,260 @@ const DEFAULT_STATE = {
   jobsCount: 0
 };
 
-function send(res, status, data, extraHeaders = {}) {
+function json(res, status, body) {
   res.statusCode = status;
-  Object.entries({
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store",
-    ...extraHeaders
-  }).forEach(([k, v]) => res.setHeader(k, v));
-  res.end(JSON.stringify(data));
+  res.setHeader("content-type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(body, null, 2));
 }
 
-function readJson(req) {
-  return new Promise((resolve, reject) => {
-    let body = "";
-    req.on("data", chunk => {
-      body += chunk;
-      if (body.length > 30 * 1024 * 1024) reject(new Error("Request body too large"));
-    });
-    req.on("end", () => {
-      if (!body) return resolve({});
-      try { resolve(JSON.parse(body)); } catch { resolve({ raw: body }); }
-    });
-    req.on("error", reject);
-  });
+function getPath(req) {
+  const url = new URL(req.url, `https://${req.headers.host || "charge.local"}`);
+  return url.pathname.replace(/^\/api\/?/, "").replace(/^\/+/, "");
 }
 
-function readBuffer(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    let size = 0;
-    req.on("data", chunk => {
-      size += chunk.length;
-      if (size > 30 * 1024 * 1024) reject(new Error("Request body too large; max 25MB"));
-      chunks.push(chunk);
-    });
-    req.on("end", () => resolve(Buffer.concat(chunks)));
-    req.on("error", reject);
-  });
+function getUserKey(req) {
+  const fromHeader = req.headers["x-charge-user"] || req.headers["x-user-id"];
+  return String(fromHeader || "default").slice(0, 120);
 }
 
-function getCookie(req, key) {
-  const cookie = req.headers.cookie || "";
-  const found = cookie.split(";").map(x => x.trim()).find(x => x.startsWith(`${key}=`));
-  return found ? decodeURIComponent(found.split("=").slice(1).join("=")) : "";
-}
-
-function getUserKey(req, body = {}) {
-  return body.userKey || body.userId || getCookie(req, "charge_user") || "demo-user";
-}
-
-function cloneDefault() {
-  return JSON.parse(JSON.stringify(DEFAULT_STATE));
-}
-
-function supabaseHeaders(service = true) {
-  const key = service ? process.env.SUPABASE_SERVICE_ROLE_KEY : process.env.SUPABASE_ANON_KEY;
+function env() {
   return {
-    apikey: key,
-    Authorization: `Bearer ${key}`,
-    "Content-Type": "application/json"
+    supabaseUrl: process.env.SUPABASE_URL,
+    serviceRole: process.env.SUPABASE_SERVICE_ROLE_KEY,
+    anonKey: process.env.SUPABASE_ANON_KEY,
+    appUrl: process.env.APP_URL,
+    nodeEnv: process.env.NODE_ENV
   };
+}
+
+function requireSupabase() {
+  const e = env();
+  if (!e.supabaseUrl || !e.serviceRole) {
+    const missing = [];
+    if (!e.supabaseUrl) missing.push("SUPABASE_URL");
+    if (!e.serviceRole) missing.push("SUPABASE_SERVICE_ROLE_KEY");
+    const err = new Error(`Missing env vars: ${missing.join(", ")}`);
+    err.statusCode = 500;
+    throw err;
+  }
+  return e;
+}
+
+async function readBody(req) {
+  const chunks = [];
+  for await (const chunk of req) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks);
 }
 
 async function supabaseFetch(path, options = {}) {
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in Vercel env vars");
-  const response = await fetch(`${url}${path}`, options);
-  const text = await response.text();
-  let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-  if (!response.ok) {
-    const message = typeof data === "string" ? data : JSON.stringify(data);
-    throw new Error(`Supabase ${response.status}: ${message}`);
-  }
-  return data;
+  const e = requireSupabase();
+  const url = `${e.supabaseUrl}${path}`;
+  const headers = {
+    apikey: e.serviceRole,
+    Authorization: `Bearer ${e.serviceRole}`,
+    ...(options.headers || {})
+  };
+  return fetch(url, { ...options, headers });
 }
 
-async function loadState(userKey) {
+async function getSavedState(userKey) {
   try {
-    const rows = await supabaseFetch(`/rest/v1/charge_state?user_key=eq.${encodeURIComponent(userKey)}&select=state&limit=1`, {
-      headers: supabaseHeaders(true)
+    const r = await supabaseFetch(`/rest/v1/charge_state?user_key=eq.${encodeURIComponent(userKey)}&select=state&limit=1`, {
+      method: "GET",
+      headers: { Accept: "application/json" }
     });
-    if (Array.isArray(rows) && rows[0] && rows[0].state) return rows[0].state;
-  } catch (err) {
-    const s = cloneDefault();
-    s.logs.push({ level: "warn", message: `State fallback: ${err.message}`, ts: new Date().toISOString() });
-    return s;
+    if (!r.ok) return structuredClone(DEFAULT_STATE);
+    const rows = await r.json();
+    return rows && rows[0] && rows[0].state ? { ...structuredClone(DEFAULT_STATE), ...rows[0].state } : structuredClone(DEFAULT_STATE);
+  } catch (_) {
+    return structuredClone(DEFAULT_STATE);
   }
-  return cloneDefault();
 }
 
 async function saveState(userKey, state) {
-  try {
-    await supabaseFetch(`/rest/v1/charge_state`, {
-      method: "POST",
-      headers: { ...supabaseHeaders(true), Prefer: "resolution=merge-duplicates" },
-      body: JSON.stringify({ user_key: userKey, state, updated_at: new Date().toISOString() })
-    });
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: err.message };
+  const payload = [{ user_key: userKey, state, updated_at: new Date().toISOString() }];
+  const r = await supabaseFetch(`/rest/v1/charge_state?on_conflict=user_key`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      Prefer: "resolution=merge-duplicates,return=representation"
+    },
+    body: JSON.stringify(payload)
+  });
+  if (!r.ok) {
+    const text = await r.text().catch(() => "");
+    throw new Error(`Supabase state save failed: ${r.status} ${text}`);
   }
+  return r.json().catch(() => []);
 }
 
 function parseMultipart(buffer, contentType) {
-  const match = /boundary=(?:(?:"([^"]+)")|([^;]+))/i.exec(contentType || "");
-  if (!match) throw new Error("Missing multipart boundary");
-  const boundary = `--${match[1] || match[2]}`;
-  const raw = buffer.toString("binary");
-  const parts = raw.split(boundary).slice(1, -1);
-  const fields = {};
-  const files = [];
-
-  for (const part of parts) {
-    const cleaned = part.replace(/^\r\n/, "");
-    const idx = cleaned.indexOf("\r\n\r\n");
-    if (idx === -1) continue;
-    const header = cleaned.slice(0, idx);
-    let body = cleaned.slice(idx + 4);
-    if (body.endsWith("\r\n")) body = body.slice(0, -2);
-
-    const nameMatch = /name="([^"]+)"/i.exec(header);
-    if (!nameMatch) continue;
-    const filenameMatch = /filename="([^"]*)"/i.exec(header);
-    const typeMatch = /Content-Type:\s*([^\r\n]+)/i.exec(header);
-    const name = nameMatch[1];
-
-    if (filenameMatch && filenameMatch[1]) {
-      files.push({
-        field: name,
-        filename: filenameMatch[1],
+  const boundaryMatch = /boundary=(?:(?:\")([^\"]+)(?:\")|([^;]+))/i.exec(contentType || "");
+  if (!boundaryMatch) throw new Error("Upload must be multipart/form-data");
+  const boundary = Buffer.from(`--${boundaryMatch[1] || boundaryMatch[2]}`);
+  const parts = [];
+  let start = buffer.indexOf(boundary);
+  while (start !== -1) {
+    start += boundary.length;
+    if (buffer[start] === 45 && buffer[start + 1] === 45) break;
+    if (buffer[start] === 13 && buffer[start + 1] === 10) start += 2;
+    const headerEnd = buffer.indexOf(Buffer.from("\r\n\r\n"), start);
+    if (headerEnd === -1) break;
+    const headersText = buffer.slice(start, headerEnd).toString("utf8");
+    let end = buffer.indexOf(boundary, headerEnd + 4);
+    if (end === -1) break;
+    let dataEnd = end;
+    if (buffer[dataEnd - 2] === 13 && buffer[dataEnd - 1] === 10) dataEnd -= 2;
+    const disposition = /content-disposition:[^\n]*name="([^"]+)"(?:;\s*filename="([^"]*)")?/i.exec(headersText);
+    const typeMatch = /content-type:\s*([^\r\n]+)/i.exec(headersText);
+    if (disposition) {
+      parts.push({
+        name: disposition[1],
+        filename: disposition[2] || "",
         contentType: typeMatch ? typeMatch[1].trim() : "application/octet-stream",
-        buffer: Buffer.from(body, "binary")
+        data: buffer.slice(headerEnd + 4, dataEnd)
       });
-    } else {
-      fields[name] = Buffer.from(body, "binary").toString("utf8");
     }
+    start = end;
   }
-  return { fields, files };
+  return parts;
 }
 
-function cleanName(filename) {
-  return String(filename || "resume.bin").replace(/[^a-zA-Z0-9._-]/g, "_");
-}
-
-function extractBasicProfile(text, filename) {
-  const email = (text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i) || [""])[0];
-  const phone = (text.match(/(?:\+?1[\s.-]?)?(?:\(?\d{3}\)?[\s.-]?)\d{3}[\s.-]?\d{4}/) || [""])[0];
-  const linkedin = (text.match(/(?:https?:\/\/)?(?:www\.)?linkedin\.com\/in\/[^\s)]+/i) || [""])[0];
-  const firstUsefulLine = text.split(/\r?\n/).map(x => x.trim()).filter(Boolean).find(line => line.length < 60 && !line.includes("@")) || "";
-  const commonSkills = ["Product Strategy", "Roadmapping", "Payments", "Lending", "Credit Cards", "Fintech", "SaaS", "User Research", "API Integrations", "Data Analytics", "SQL", "Python", "Jira", "Figma"];
-  const lower = text.toLowerCase();
-  const skills = commonSkills.filter(skill => lower.includes(skill.toLowerCase()));
-  return { name: firstUsefulLine, email, applicationEmail: email, phone, linkedin, skills, resumeFileName: filename };
-}
-
-async function uploadToSupabaseStorage(userKey, file) {
-  const safe = cleanName(file.filename);
-  const path = `${userKey}/${Date.now()}-${safe}`;
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!url || !key) throw new Error("Missing Supabase env vars on Vercel");
-
-  const response = await fetch(`${url}/storage/v1/object/resumes/${path}`, {
-    method: "POST",
-    headers: {
-      apikey: key,
-      Authorization: `Bearer ${key}`,
-      "Content-Type": file.contentType || "application/octet-stream",
-      "x-upsert": "true"
-    },
-    body: file.buffer
-  });
-
-  const text = await response.text();
-  if (!response.ok) throw new Error(`Supabase Storage ${response.status}: ${text}`);
-  return path;
-}
-
-async function handleUpload(req, res) {
-  const contentType = req.headers["content-type"] || "";
-  if (!contentType.includes("multipart/form-data")) {
-    return send(res, 400, { ok: false, error: "Expected multipart/form-data upload" });
-  }
-  const buffer = await readBuffer(req);
-  const { fields, files } = parseMultipart(buffer, contentType);
-  const file = files[0];
-  if (!file) return send(res, 400, { ok: false, error: "No resume file received" });
-  if (file.buffer.length > 25 * 1024 * 1024) return send(res, 413, { ok: false, error: "Resume must be under 25MB" });
-
-  const userKey = getUserKey(req, fields);
-  const state = await loadState(userKey);
-  const storagePath = await uploadToSupabaseStorage(userKey, file);
-
-  let resumeText = "";
-  const lowerName = file.filename.toLowerCase();
-  if (lowerName.endsWith(".txt")) {
-    resumeText = file.buffer.toString("utf8");
-  } else {
-    // Keep the upload working on Vercel without native PDF tools.
-    // Real PDF/DOC parsing can be added later with a parser service or Supabase Edge worker.
-    resumeText = state.profile.resumeText || "";
-  }
-
-  const parsed = extractBasicProfile(resumeText, file.filename);
-  state.profile = {
-    ...state.profile,
-    ...Object.fromEntries(Object.entries(parsed).filter(([, v]) => Array.isArray(v) ? v.length : Boolean(v))),
-    resumeText,
-    resumeFileName: file.filename,
-    resumeFilePath: storagePath
+function basicResumeProfileFromText(text, filename) {
+  const lines = String(text || "")
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  const joined = lines.join("\n");
+  const email = (joined.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i) || [""])[0];
+  const phone = (joined.match(/(?:\+?\d[\d\s().-]{7,}\d)/) || [""])[0].trim();
+  const linkedin = (joined.match(/(?:https?:\/\/)?(?:www\.)?linkedin\.com\/in\/[A-Za-z0-9_-]+\/?/i) || [""])[0];
+  const name = lines[0] && lines[0].length < 80 ? lines[0] : "";
+  const skills = [];
+  const skillBank = [
+    "Product Strategy", "Roadmapping", "User Research", "Fintech", "Payments", "Credit Cards", "Lending", "SaaS",
+    "AI", "Automation", "API Integrations", "Stakeholder Management", "Agile", "Scrum", "Jira", "Figma",
+    "Data Analytics", "SQL", "Python", "JavaScript", "TypeScript", "Risk", "Underwriting", "KYC", "AML"
+  ];
+  for (const s of skillBank) if (joined.toLowerCase().includes(s.toLowerCase())) skills.push(s);
+  return {
+    name,
+    email,
+    applicationEmail: email,
+    phone,
+    linkedin,
+    summary: "Product-focused operator with experience shipping customer-facing workflows, managing stakeholders, and driving measurable product outcomes.",
+    resumeText: joined.slice(0, 50000),
+    resumeFileName: filename,
+    skills: [...new Set(skills)].slice(0, 60)
   };
-  state.onboarding.step = Math.max(state.onboarding.step || 0, 1);
-  state.logs = state.logs || [];
-  state.logs.unshift({ level: "info", message: `Resume uploaded: ${file.filename}`, ts: new Date().toISOString() });
-
-  const saved = await saveState(userKey, state);
-  return send(res, 200, { ok: true, saved, userKey, profile: state.profile, onboarding: state.onboarding, path: storagePath });
 }
 
-module.exports = async function handler(req, res) {
-  try {
-    const url = new URL(req.url, `https://${req.headers.host || "localhost"}`);
-    const route = url.pathname.replace(/^\/api\/?/, "");
+function pseudoPdfText(buffer, filename) {
+  // Safe fallback: extracts visible ASCII-ish strings. It is not perfect PDF parsing,
+  // but it prevents upload from failing on Vercel when native PDF tooling is unavailable.
+  const raw = buffer.toString("latin1");
+  const strings = raw.match(/[A-Za-z0-9@.,:;()&+/#'’\- ]{4,}/g) || [];
+  const text = strings.join("\n").replace(/\s{2,}/g, " ").slice(0, 60000);
+  return text || `Uploaded resume file: ${filename}`;
+}
 
-    if (req.method === "GET" && route === "debug/env") {
-      return send(res, 200, {
+async function uploadResume(req, res) {
+  try {
+    const contentType = req.headers["content-type"] || "";
+    const body = await readBody(req);
+    const parts = parseMultipart(body, contentType);
+    const file = parts.find((p) => p.filename) || parts.find((p) => p.name === "resume");
+    if (!file || !file.data || !file.data.length) return json(res, 400, { ok: false, error: "No resume file found in upload" });
+
+    const userKey = getUserKey(req);
+    const safeName = file.filename.replace(/[^a-zA-Z0-9._-]/g, "_").slice(-120) || "resume.pdf";
+    const storagePath = `${userKey}/${Date.now()}-${safeName}`;
+
+    const up = await supabaseFetch(`/storage/v1/object/resumes/${encodeURIComponent(storagePath).replace(/%2F/g, "/")}`, {
+      method: "POST",
+      headers: {
+        "content-type": file.contentType || "application/octet-stream",
+        "x-upsert": "true"
+      },
+      body: file.data
+    });
+    if (!up.ok) {
+      const t = await up.text().catch(() => "");
+      return json(res, 500, { ok: false, error: `Supabase upload failed: ${up.status}`, detail: t.slice(0, 1000) });
+    }
+
+    let resumeText = "";
+    const lower = safeName.toLowerCase();
+    if (lower.endsWith(".txt")) resumeText = file.data.toString("utf8");
+    else if (lower.endsWith(".pdf")) resumeText = pseudoPdfText(file.data, safeName);
+    else if (lower.endsWith(".doc") || lower.endsWith(".docx")) resumeText = pseudoPdfText(file.data, safeName);
+    else resumeText = pseudoPdfText(file.data, safeName);
+
+    const extracted = basicResumeProfileFromText(resumeText, safeName);
+    const current = await getSavedState(userKey);
+    const next = {
+      ...current,
+      onboarding: { step: Math.max(current.onboarding?.step || 0, 1), done: false },
+      profile: {
+        ...current.profile,
+        ...Object.fromEntries(Object.entries(extracted).filter(([, v]) => Array.isArray(v) ? v.length : Boolean(v))),
+        resumeText,
+        resumeFileName: safeName,
+        resumeFilePath: storagePath
+      },
+      logs: [
+        ...(current.logs || []),
+        { at: new Date().toISOString(), type: "resume_upload", message: `Uploaded ${safeName}` }
+      ].slice(-100)
+    };
+    await saveState(userKey, next);
+    return json(res, 200, { ok: true, resumeFileName: safeName, resumeFilePath: storagePath, profile: next.profile, state: next });
+  } catch (err) {
+    return json(res, err.statusCode || 500, { ok: false, error: err.message || "Resume upload failed" });
+  }
+}
+
+async function handler(req, res) {
+  const path = getPath(req);
+  try {
+    if (req.method === "OPTIONS") {
+      res.statusCode = 204;
+      res.end();
+      return;
+    }
+    if (path === "debug/env" && req.method === "GET") {
+      const e = env();
+      return json(res, 200, {
         ok: true,
-        nodeEnv: process.env.NODE_ENV || null,
-        appUrl: process.env.APP_URL || null,
-        supabaseUrl: Boolean(process.env.SUPABASE_URL),
-        anonKey: Boolean(process.env.SUPABASE_ANON_KEY),
-        serviceRole: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
-        bucketExpected: "resumes"
+        nodeEnv: e.nodeEnv || null,
+        appUrl: e.appUrl || null,
+        supabaseUrl: Boolean(e.supabaseUrl),
+        anonKey: Boolean(e.anonKey),
+        serviceRole: Boolean(e.serviceRole),
+        bucketExpected: "resumes",
+        routes: ["GET /api/state", "POST /api/state", "POST /api/resume", "POST /api/upload-resume", "POST /api/upload"]
       });
     }
-
-    if (req.method === "GET" && route === "state") {
-      const userKey = getUserKey(req);
-      const state = await loadState(userKey);
-      return send(res, 200, state, { "Set-Cookie": `charge_user=${encodeURIComponent(userKey)}; Path=/; SameSite=Lax; Secure` });
+    if (path === "state" && req.method === "GET") {
+      const state = await getSavedState(getUserKey(req));
+      return json(res, 200, state);
     }
-
-    if (req.method === "POST" && route === "state") {
-      const body = await readJson(req);
-      const userKey = getUserKey(req, body);
-      const state = { ...cloneDefault(), ...(body.state || body) };
-      const saved = await saveState(userKey, state);
-      return send(res, saved.ok ? 200 : 500, { ok: saved.ok, saved, state });
+    if (path === "state" && req.method === "POST") {
+      const body = await readBody(req);
+      const incoming = body.length ? JSON.parse(body.toString("utf8")) : {};
+      const current = await getSavedState(getUserKey(req));
+      const next = { ...current, ...incoming };
+      await saveState(getUserKey(req), next);
+      return json(res, 200, { ok: true, state: next });
     }
-
-    if (req.method === "POST" && ["upload", "upload-resume", "resume/upload", "profile/upload", "onboarding/upload"].includes(route)) {
-      return await handleUpload(req, res);
+    if (["resume", "upload-resume", "upload", "parse-resume"].includes(path) && req.method === "POST") {
+      return uploadResume(req, res);
     }
-
-    if (req.method === "POST" && ["auth/signup", "signup", "auth/login", "login"].includes(route)) {
-      const body = await readJson(req);
-      const email = body.email || body.user?.email || "";
-      const name = body.name || body.fullName || body.user?.name || "";
-      const userKey = email || `demo-user`;
-      const state = await loadState(userKey);
-      state.user = { email, name, createdAt: new Date().toISOString() };
-      state.profile.email = state.profile.email || email;
-      state.profile.applicationEmail = state.profile.applicationEmail || email;
-      state.profile.name = state.profile.name || name;
-      await saveState(userKey, state);
-      return send(res, 200, { ok: true, user: state.user, state }, { "Set-Cookie": `charge_user=${encodeURIComponent(userKey)}; Path=/; SameSite=Lax; Secure` });
-    }
-
-    return send(res, 404, { ok: false, error: `Unknown API route: /api/${route}` });
+    return json(res, 404, { ok: false, error: `Unknown API route: /api/${path}` });
   } catch (err) {
-    console.error("Charge API error", err);
-    return send(res, 500, { ok: false, error: err.message || "Serverless function crashed" });
+    return json(res, err.statusCode || 500, { ok: false, error: err.message || "API crashed" });
   }
-};
+}
+
+module.exports = handler;

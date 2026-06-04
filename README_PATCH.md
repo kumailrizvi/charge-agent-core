@@ -1,53 +1,39 @@
-# Charge Vercel API crash fix
+# Charge resume route patch
 
-Add these files to your project root:
+This patch fixes the current Vercel error:
 
-- `api/[...path].js`
-- `supabase/charge_schema.sql`
+`Upload failed: Unknown API route: /api/resume`
 
-This patch avoids importing `server/index.js` in Vercel. Your Vercel API was crashing on `/api/state` and `/api/debug/env`; this file makes those routes self-contained.
+It adds support for:
 
-## Supabase
+- `GET /api/debug/env`
+- `GET /api/state`
+- `POST /api/state`
+- `POST /api/resume`
+- `POST /api/upload-resume`
+- `POST /api/upload`
 
-1. Go to Supabase SQL Editor.
-2. Paste and run `supabase/charge_schema.sql`.
-3. Confirm Storage bucket `resumes` exists and is private.
+It stores uploaded resume files in the private Supabase Storage bucket named `resumes`, and saves app state in the `charge_state` table.
 
-## Vercel env vars
+## Install
 
-Set Production env vars:
-
-```env
-SUPABASE_URL=https://kgggjmdhlqtejjfajogb.supabase.co
-SUPABASE_ANON_KEY=your_publishable_key
-SUPABASE_SERVICE_ROLE_KEY=your_rotated_service_role_key
-APP_URL=https://charge-agent-core.vercel.app
-NODE_ENV=production
-CHARGE_SHOW_BROWSER=0
-CHARGE_AUTO_SUBMIT_TRUSTED=0
-```
-
-Do not commit `.env`.
-
-## Test after deploy
-
-- `https://charge-agent-core.vercel.app/api/debug/env`
-- `https://charge-agent-core.vercel.app/api/state`
-
-Both should return JSON, not a Vercel crash page.
-
-## Git push
+Copy the files into your project root:
 
 ```bash
-cd ~/Desktop/charge-agent-core
+cp -R charge_resume_route_patch/api .
+cp -R charge_resume_route_patch/supabase .
+```
 
+Run the SQL in Supabase SQL Editor:
+
+```sql
+-- supabase/charge_schema.sql
+```
+
+Push to GitHub:
+
+```bash
 git add .
-git commit -m "Fix Vercel API crash and resume upload route"
+git commit -m "Fix resume API route on Vercel"
 git push
-```
-
-If needed:
-
-```bash
-git push --set-upstream origin main
 ```
