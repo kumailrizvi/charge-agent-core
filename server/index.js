@@ -3,70 +3,12 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-
-// Load .env manually so local Supabase keys work without extra setup.
-function loadEnvFile(){
-  try {
-    const envPath = path.join(__dirname, '..', '.env');
-    if (!fs.existsSync(envPath)) return;
-    const lines = fs.readFileSync(envPath, 'utf8').split('\n');
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) continue;
-      const idx = trimmed.indexOf('=');
-      const key = trimmed.slice(0, idx).trim();
-      let val = trimmed.slice(idx + 1).trim();
-      if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) val = val.slice(1, -1);
-      if (!process.env[key]) process.env[key] = val;
-    }
-  } catch (e) { console.warn('Could not load .env:', e.message); }
-}
-loadEnvFile();
-let supabase = null;
-try {
-  const { createClient } = require('@supabase/supabase-js');
-  if (process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY) {
-    supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } });
-  }
-} catch (e) {
-  console.warn('Supabase client not installed yet. Run npm install. Continuing with local storage.');
-}
-async function bestEffortSupabaseResumeSave({ state, fileName, fileBuffer, text }) {
-  if (!supabase || !fileName || !fileBuffer) return { enabled:false, saved:false, reason:'Supabase not configured' };
-  const email = state.profile?.email || state.profile?.applicationEmail || state.user?.email || 'local-user@charge.local';
-  const safe = String(fileName).replace(/[^a-zA-Z0-9._-]/g,'_');
-  const storagePath = `${email.replace(/[^a-zA-Z0-9._-]/g,'_')}/${Date.now()}-${safe}`;
-  try {
-    const upload = await supabase.storage.from('resumes').upload(storagePath, fileBuffer, { contentType: 'application/octet-stream', upsert: true });
-    if (upload.error) throw upload.error;
-    const profilePayload = {
-      email,
-      full_name: state.profile?.name || state.user?.name || '',
-      phone: state.profile?.phone || '',
-      linkedin: state.profile?.linkedin || '',
-      location: state.profile?.location || '',
-      application_email: state.profile?.applicationEmail || email,
-      resume_file_path: storagePath,
-      resume_file_name: safe,
-      resume_text: text || state.profile?.resumeText || '',
-      structured_profile: state.profile || {},
-      updated_at: new Date().toISOString()
-    };
-    const upsert = await supabase.from('profiles').upsert(profilePayload, { onConflict: 'email' });
-    if (upsert.error) throw upsert.error;
-    return { enabled:true, saved:true, path:storagePath };
-  } catch (e) {
-    console.warn('Supabase resume save failed:', e.message || e);
-    return { enabled:true, saved:false, reason:e.message || String(e) };
-  }
-}
-
 const { execFile } = require('child_process');
 const { runBrowserApply } = require('./browserWorker');
 
 const ROOT = path.join(__dirname, '..');
 const PUBLIC = path.join(ROOT, 'public');
-const DATA = path.join(ROOT, 'data', 'state.json');
+const DATA = process.env.VERCEL ? path.join('/tmp', 'charge-state.json') : path.join(ROOT, 'data', 'state.json');
 const UPLOADS = path.join(ROOT, 'uploads');
 const PORT = process.env.PORT || 8787;
 const TRUSTED = ['greenhouse','lever','ashby','smartrecruiters','workable','recruitee','bamboohr','teamtailor','remoteok'];
@@ -84,7 +26,7 @@ function readState(){ try { return {...structuredClone(emptyState), ...JSON.pars
 function writeState(s){ fs.mkdirSync(path.dirname(DATA),{recursive:true}); fs.writeFileSync(DATA, JSON.stringify(s,null,2)); }
 function publicState(s){ const copy=JSON.parse(JSON.stringify(s)); copy.jobsCount=(s.jobs||[]).length; copy.jobs=[]; return copy; }
 function send(res, code, body, type='application/json'){ res.writeHead(code, {'content-type': type, 'access-control-allow-origin':'*','access-control-allow-methods':'GET,POST,OPTIONS','access-control-allow-headers':'content-type'}); res.end(type==='application/json'?JSON.stringify(body):body); }
-function parseBody(req){ return new Promise(resolve=>{ let b=''; req.on('data',d=>{ b+=d; if(b.length>120e6) { console.warn('Large request body received:', b.length); } }); req.on('end',()=>{ try{ resolve(b?JSON.parse(b):{}); } catch{ resolve({ raw:b }); } }); }); }
+function parseBody(req){ return new Promise(resolve=>{ let b=''; req.on('data',d=>{ b+=d; if(b.length>30e6) req.destroy(); }); req.on('end',()=>{ try{ resolve(b?JSON.parse(b):{}); } catch{ resolve({ raw:b }); } }); }); }
 function id(prefix='id'){ return prefix+'_'+crypto.randomBytes(6).toString('hex'); }
 function decodeEntities(str=''){ return String(str).replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&amp;/g,'&').replace(/&quot;/g,'\"').replace(/&#039;|&apos;/g,"'").replace(/&nbsp;/g,' '); }
 function textClean(s){ return decodeEntities(String(s||'')).replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim(); }
@@ -130,48 +72,10 @@ function filterJobs(state,q){ let arr=(state.jobs||[]).map(j=>({...j,match:score
 function runApplicationWorker(appId, opts={}){ let state=readState(); const app=(state.applications||[]).find(a=>a.id===appId); if(!app) return null; const job=(state.jobs||[]).find(j=>j.id===app.jobId)||{...app,title:app.role,company:app.company,applyUrl:app.url}; app.status='in_flight'; app.statusLabel='Applying'; app.logs=app.logs||[]; app.logs.unshift({at:new Date().toISOString(),message:'Background auto-apply worker started.'}); writeState(state); runBrowserApply({ application:app, job, profile:state.profile, packet:app.packet, forceSubmit:!!opts.forceSubmit, onLog:(m)=>{ const s=readState(); const a=s.applications.find(x=>x.id===appId); if(a){a.logs=a.logs||[];a.logs.unshift({at:new Date().toISOString(),message:m});writeState(s);} }, onFormFields:(fields)=>{ const s=readState(); const a=s.applications.find(x=>x.id===appId); if(a){a.formFields=fields;writeState(s);} }, onUpdate:async(status,reason)=>{ const s=readState(); const a=s.applications.find(x=>x.id===appId); if(a){ a.status=status; a.statusLabel=status==='submitted'?'Submitted':status==='needs_review'?'Needs you':status==='failed'?'Failed':'Applying'; a.reason=reason; a.updatedAt=new Date().toISOString(); a.logs=a.logs||[]; a.logs.unshift({at:new Date().toISOString(),message:reason}); writeState(s);} } }); return app; }
 async function handle(req,res){ const url=new URL(req.url,`http://${req.headers.host}`); if(req.method==='OPTIONS') return send(res,204,{}); if(url.pathname.startsWith('/api/')||url.pathname.startsWith('/webhooks/')){ let state=readState();
   if(req.method==='GET'&&url.pathname==='/api/state') return send(res,200,publicState(state));
-  if(req.method==='GET'&&url.pathname==='/api/debug/env') return send(res,200,{ok:true,supabaseUrl:!!process.env.SUPABASE_URL,serviceRole:!!process.env.SUPABASE_SERVICE_ROLE_KEY,supabaseClient:!!supabase,bucket:'resumes'});
   if(req.method==='POST'&&url.pathname==='/api/logout'){ writeState(structuredClone(emptyState)); return send(res,200,{ok:true}); }
   if(req.method==='POST'&&url.pathname==='/api/signup'){ const b=await parseBody(req); state.user={id:id('user'),name:b.name||'',email:b.email||''}; state.profile={...state.profile,name:b.name||state.profile.name,email:b.email||state.profile.email,applicationEmail:b.applicationEmail||b.email||state.profile.applicationEmail}; state.target={...state.target,roles:b.roles||state.target.roles,countries:b.countries||state.target.countries,cities:b.cities||state.target.cities}; state.onboarding={step:b.step||0,done:!!b.done}; writeState(state); ensureCrawler('signup'); return send(res,200,{ok:true,state:publicState(state)}); }
   if(req.method==='POST'&&url.pathname==='/api/profile'){ const b=await parseBody(req); state.profile={...state.profile,...b.profile}; state.target={...state.target,...(b.target||{})}; writeState(state); return send(res,200,{ok:true,profile:state.profile,target:state.target}); }
-  if(req.method==='POST'&&url.pathname==='/api/resume'){
-    const b=await parseBody(req);
-    fs.mkdirSync(UPLOADS,{recursive:true});
-    let extracted=b.text||'';
-    let storedPath='';
-    let safe='';
-    if(b.fileBase64&&b.fileName){
-      safe=b.fileName.replace(/[^a-zA-Z0-9._-]/g,'_');
-      storedPath=path.join(UPLOADS,`${Date.now()}-${safe}`);
-      fs.writeFileSync(storedPath,Buffer.from(String(b.fileBase64).split(',').pop(),'base64'));
-      state.profile.resumeFileName=safe;
-      state.profile.resumeFilePath=storedPath;
-      // IMPORTANT: return fast. Do not block onboarding on pdftotext/poppler.
-      // Try a very quick best-effort extraction only; never hang upload.
-      if(!extracted && /\.pdf$/i.test(safe)) extracted=roughPdfText(storedPath).slice(0,50000);
-    }
-    if(extracted){
-      const parsed=parseResume(extracted,state.profile);
-      state.profile={...state.profile,...parsed,resumeText:extracted};
-    }
-    state.profile.resumeUploadedAt=new Date().toISOString();
-    state.logs=state.logs||[];
-    state.logs.unshift({at:new Date().toISOString(),message:`Resume stored${extracted?' and parsed with quick extractor':''}: ${state.profile.resumeFileName||'text'}`});
-    writeState(state);
-    // Best-effort Supabase save happens after local state is committed. It must not block onboarding.
-    try {
-      const fileBuffer = storedPath ? fs.readFileSync(storedPath) : null;
-      bestEffortSupabaseResumeSave({state,fileName:safe,fileBuffer,text:extracted}).then(result=>{
-        const latest=readState();
-        latest.profile.supabaseResume=result;
-        if(result.saved) latest.profile.resumeFilePath=result.path;
-        latest.logs=latest.logs||[];
-        latest.logs.unshift({at:new Date().toISOString(),message:result.saved?`Resume also saved to Supabase: ${result.path}`:`Supabase save skipped/failed: ${result.reason||'not configured'}`});
-        writeState(latest);
-      }).catch(()=>{});
-    } catch {}
-    return send(res,200,{ok:true,profile:state.profile,extracted:!!extracted,stored:!!state.profile.resumeFileName,fileName:state.profile.resumeFileName,supabaseConfigured:!!supabase,message: extracted?'Stored and parsed.':'Stored instantly. Supabase save runs in background.'});
-  }
+  if(req.method==='POST'&&url.pathname==='/api/resume'){ const b=await parseBody(req); fs.mkdirSync(UPLOADS,{recursive:true}); let extracted=b.text||''; if(b.fileBase64&&b.fileName){ const safe=b.fileName.replace(/[^a-zA-Z0-9._-]/g,'_'); const p=path.join(UPLOADS,`${Date.now()}-${safe}`); fs.writeFileSync(p,Buffer.from(b.fileBase64.split(',').pop(),'base64')); state.profile.resumeFileName=safe; state.profile.resumeFilePath=p; if(/\.pdf$/i.test(safe)) extracted=extracted||await extractPdf(p); } if(extracted){ const parsed=parseResume(extracted,state.profile); state.profile={...state.profile,...parsed,resumeText:extracted}; } state.profile.resumeUploadedAt=new Date().toISOString(); state.logs=state.logs||[]; state.logs.unshift({at:new Date().toISOString(),message:`Resume stored${extracted?' and parsed':''}: ${state.profile.resumeFileName||'text'}`}); writeState(state); return send(res,200,{ok:true,profile:state.profile,extracted:!!extracted,stored:!!state.profile.resumeFileName,fileName:state.profile.resumeFileName}); }
   if(req.method==='GET'&&url.pathname==='/api/jobs'){ const page=Number(url.searchParams.get('page')||1), limit=Math.min(Number(url.searchParams.get('limit')||25),50); const arr=filterJobs(state,Object.fromEntries(url.searchParams)); const start=(page-1)*limit; return send(res,200,{items:arr.slice(start,start+limit),total:arr.length,page,limit}); }
   if(req.method==='POST'&&url.pathname==='/api/crawl'){ ensureCrawler('manual'); return send(res,200,{ok:true,message:'crawler started'}); }
   if(req.method==='GET'&&url.pathname==='/api/applications') return send(res,200,{items:state.applications||[]});
@@ -188,4 +92,14 @@ async function handle(req,res){ const url=new URL(req.url,`http://${req.headers.
   return send(res,404,{error:'not found'});
 }
 let p=url.pathname==='/'?'/index.html':url.pathname; p=path.join(PUBLIC,p); if(!p.startsWith(PUBLIC)) return send(res,403,'forbidden','text/plain'); fs.readFile(p,(e,d)=>{ if(e) return send(res,404,'not found','text/plain'); const ext=path.extname(p); const type=ext==='.js'?'application/javascript':ext==='.css'?'text/css':'text/html'; send(res,200,d,type); }); }
-http.createServer(handle).listen(PORT,()=>{ console.log(`Charge running on http://localhost:${PORT}`); setTimeout(()=>ensureCrawler('startup'),800); setInterval(()=>ensureCrawler('interval'),1000*60*30); });
+
+if (require.main === module) {
+  http.createServer(handle).listen(PORT,()=>{
+    console.log(`Charge running on http://localhost:${PORT}`);
+    setTimeout(()=>ensureCrawler('startup'),800);
+    setInterval(()=>ensureCrawler('interval'),1000*60*30);
+  });
+}
+
+module.exports = { handle, readState, writeState, ensureCrawler };
+

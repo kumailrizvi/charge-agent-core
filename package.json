@@ -3,14 +3,7 @@
   "version": "0.5.0",
   "description": "Charge AI job application operator MVP",
   "main": "server/index.js",
-  "scripts": {
-    "dev": "node server/index.js"
-  },
-  "dependencies": {
-    "playwright-core": "^1.48.2",
-    "@supabase/supabase-js": "^2.45.4"
-  },
-  "engines": {
-    "node": ">=18"
-  }
+  "scripts": {"dev":"node server/index.js"},
+  "dependencies": {"playwright-core":"^1.48.2"},
+  "engines": {"node": ">=18"}
 }
